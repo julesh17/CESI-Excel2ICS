@@ -9,7 +9,6 @@ import pytz
 # ---------------- Utilities ----------------
 
 def normalize_group_label(x):
-    """Normalize different notations to 'G N' or return None."""
     if x is None:
         return None
     try:
@@ -26,11 +25,10 @@ def normalize_group_label(x):
     m2 = re.search(r'^(?:groupe)?\s*(\d+)$', s, re.I)
     if m2:
         return f'G {m2.group(1)}'
-    # fallback: return cleaned string
     return s
 
+
 def is_time_like(x):
-    """Detect if cell looks like a time."""
     if x is None:
         return False
     if isinstance(x, (pd.Timestamp, datetime, time)):
@@ -38,14 +36,14 @@ def is_time_like(x):
     s = str(x).strip()
     if not s:
         return False
-    # common time patterns: 08:30, 8:30, 08h30, 8h30
-    if re.match(r'^\d{1,2}[:hH]\d{2}(\s*[APMapm\.]*)?$', s):
+    # match 08:30, 8:30, 08h30, 8h30, 08:30 AM, etc.
+    if re.match(r'^\d{1,2}[:hH]\d{2}(\s*[AaPp][Mm]\.?)*$', s):
         return True
-    # sometimes Excel stores fractional day as float -> pandas gives Timestamp usually; ignore floats
+    # sometimes there are floats representing time - handled by pandas as Timestamp usually
     return False
 
+
 def to_time(x):
-    """Convert a time-like cell to a datetime.time or None."""
     if x is None:
         return None
     if isinstance(x, time):
@@ -57,7 +55,6 @@ def to_time(x):
     s = str(x).strip()
     if not s:
         return None
-    # replace 'h' with ':' for parsing convenience
     s2 = s.replace('h', ':').replace('H', ':')
     try:
         dt = dtparser.parse(s2, dayfirst=True)
@@ -65,8 +62,8 @@ def to_time(x):
     except Exception:
         return None
 
+
 def to_date(x):
-    """Convert a date-like cell to datetime.date or None."""
     if x is None:
         return None
     if isinstance(x, pd.Timestamp):
@@ -78,14 +75,13 @@ def to_date(x):
     s = str(x).strip()
     if not s:
         return None
-    # try parse with dateutil (dayfirst True)
     try:
         dt = dtparser.parse(s, dayfirst=True, fuzzy=True)
         return dt.date()
     except Exception:
         return None
 
-# ---------------- Sheet parser ----------------
+# ---------------- Parsing ----------------
 
 def find_week_rows(df):
     rows = []
@@ -98,6 +94,7 @@ def find_week_rows(df):
             rows.append(i)
     return rows
 
+
 def find_slot_rows(df):
     rows = []
     for i in range(len(df)):
@@ -109,11 +106,8 @@ def find_slot_rows(df):
             rows.append(i)
     return rows
 
+
 def parse_sheet_to_events(xls, sheet_name):
-    """
-    Parse a timetable sheet (header=None) -> list of event dicts:
-      { summary, teachers (set), description (set), start(datetime), end(datetime), groups (set) }
-    """
     df = pd.read_excel(xls, sheet_name=sheet_name, header=None)
     nrows, ncols = df.shape
 
@@ -123,7 +117,6 @@ def parse_sheet_to_events(xls, sheet_name):
     raw_events = []
 
     for r in h_rows:
-        # find preceding week header
         p_candidates = [s for s in s_rows if s <= r]
         if not p_candidates:
             continue
@@ -131,15 +124,12 @@ def parse_sheet_to_events(xls, sheet_name):
         date_row = p + 1
         group_row = p + 2
 
-        # candidate columns are where date_row contains a date
         date_cols = [c for c in range(ncols) if date_row < nrows and to_date(df.iat[date_row, c]) is not None]
 
         for c in date_cols:
             for col in (c, c + 1):
                 if col >= ncols:
                     continue
-
-                # summary
                 try:
                     summary = df.iat[r, col]
                 except Exception:
@@ -150,7 +140,7 @@ def parse_sheet_to_events(xls, sheet_name):
                 if not summary_str:
                     continue
 
-                # teacher (commonly at r+2)
+                # teacher
                 teacher = None
                 if (r + 2) < nrows:
                     try:
@@ -160,10 +150,26 @@ def parse_sheet_to_events(xls, sheet_name):
                     except Exception:
                         teacher = None
 
-                # try read small free-text description near the summary (e.g. 'Examen', 'Partiel', ...)
+                # determine the index of the first time-like cell after the summary
+                stop_idx = None
+                for off in range(1, 12):
+                    idx = r + off
+                    if idx >= nrows:
+                        break
+                    try:
+                        if is_time_like(df.iat[idx, col]):
+                            stop_idx = idx
+                            break
+                    except Exception:
+                        continue
+                if stop_idx is None:
+                    stop_idx = min(r + 7, nrows)
+
+                # collect description cells between summary row and first time cell (exclusive)
                 desc_parts = []
-                # scan a window below the summary but above times: r+1 .. r+6
-                for idx in range(r + 1, min(r + 7, nrows)):
+                for idx in range(r + 1, stop_idx):
+                    if idx >= nrows:
+                        break
                     try:
                         cell = df.iat[idx, col]
                     except Exception:
@@ -173,58 +179,43 @@ def parse_sheet_to_events(xls, sheet_name):
                     s = str(cell).strip()
                     if not s:
                         continue
-                    # skip if looks like a time or a date or equals teacher/summary
-                    if is_time_like(cell):
-                        continue
+                    # skip dates and teacher/summary repetitions
                     if to_date(cell) is not None:
                         continue
                     if teacher and s == teacher:
                         continue
                     if s == summary_str:
                         continue
-                    # otherwise it's plausible description text
+                    # plausible description
                     desc_parts.append(s)
-                desc_text = " | ".join(dict.fromkeys(desc_parts))  # unique preserving order
+                desc_text = " | ".join(dict.fromkeys(desc_parts))
 
-                # find start/end times (common offsets r+4/r+5) else search next rows
+                # times: prefer the first time-like cell (start) and the next distinct time-like cell (end)
                 start_val = None
                 end_val = None
-                if (r + 4) < nrows:
-                    start_val = df.iat[r + 4, col]
-                if (r + 5) < nrows:
-                    end_val = df.iat[r + 5, col]
-
-                # fallback heuristic scan for time-like cells
-                if not is_time_like(start_val):
-                    for off in range(1, 10):
-                        idx = r + off
-                        if idx >= nrows:
-                            break
+                # search from r+1 up to r+12 for times
+                for off in range(1, 13):
+                    idx = r + off
+                    if idx >= nrows:
+                        break
+                    try:
                         v = df.iat[idx, col]
-                        if is_time_like(v):
+                    except Exception:
+                        v = None
+                    if is_time_like(v):
+                        if start_val is None:
                             start_val = v
-                            break
-
-                if not is_time_like(end_val):
-                    for off in range(1, 12):
-                        idx = r + off
-                        if idx >= nrows:
-                            break
-                        v = df.iat[idx, col]
-                        if is_time_like(v) and v != start_val:
+                        elif end_val is None and v != start_val:
                             end_val = v
                             break
-
-                if not is_time_like(start_val) or not is_time_like(end_val):
-                    # cannot determine times -> skip
+                if start_val is None or end_val is None:
                     continue
-
                 start_t = to_time(start_val)
                 end_t = to_time(end_val)
                 if start_t is None or end_t is None:
                     continue
 
-                # date (from date_row, column c)
+                # date of the day
                 date_cell = df.iat[date_row, c]
                 d = to_date(date_cell)
                 if d is None:
@@ -233,7 +224,7 @@ def parse_sheet_to_events(xls, sheet_name):
                 dtstart = datetime.combine(d, start_t)
                 dtend = datetime.combine(d, end_t)
 
-                # read group labels
+                # groups
                 gl = None
                 gl_next = None
                 if group_row < nrows:
@@ -249,7 +240,6 @@ def parse_sheet_to_events(xls, sheet_name):
                         except Exception:
                             gl_next = None
 
-                # detect merged summary spanning both group columns => "classe entière"
                 is_left_col = (col == c)
                 right_summary = None
                 if (col + 1) < ncols:
@@ -260,31 +250,22 @@ def parse_sheet_to_events(xls, sheet_name):
 
                 groups = set()
                 if is_left_col and (pd.isna(right_summary) or right_summary is None) and gl and gl_next and gl != gl_next:
-                    # left has summary, right empty, both group labels exist -> class entière
                     groups.add(gl)
                     groups.add(gl_next)
                 else:
                     if gl:
                         groups.add(gl)
 
-                # keep teacher and description as sets for merging later
-                teachers = set()
-                if teacher:
-                    teachers.add(teacher)
-                descriptions = set()
-                if desc_text:
-                    descriptions.add(desc_text)
-
                 raw_events.append({
                     'summary': summary_str,
-                    'teachers': teachers,
-                    'descriptions': descriptions,
+                    'teachers': set([teacher]) if teacher else set(),
+                    'descriptions': set([desc_text]) if desc_text else set(),
                     'start': dtstart,
                     'end': dtend,
                     'groups': groups
                 })
 
-    # merge events that have same summary+start+end (combine groups/teachers/descriptions)
+    # merge events by (summary,start,end)
     merged = {}
     for e in raw_events:
         key = (e['summary'], e['start'], e['end'])
@@ -309,7 +290,7 @@ def parse_sheet_to_events(xls, sheet_name):
             'description': " | ".join(sorted(list(v['descriptions']))) if v['descriptions'] else "",
             'start': v['start'],
             'end': v['end'],
-            'groups': sorted(list(v['groups']))  # could be empty list
+            'groups': sorted(list(v['groups']))
         })
     return out
 
@@ -324,6 +305,7 @@ def escape_ical_text(s: str) -> str:
     s = s.replace(',', '\\,')
     s = s.replace(';', '\\;')
     return s
+
 
 def events_to_ics(events, tzname='Europe/Paris'):
     tz = pytz.timezone(tzname)
@@ -350,7 +332,6 @@ def events_to_ics(events, tzname='Europe/Paris'):
             if len(groups) == 1:
                 desc_lines.append('Groupe: ' + groups[0])
             else:
-                # render as "Groupes: G 1 et G 2"
                 desc_lines.append('Groupes: ' + ' et '.join(groups))
 
         description = escape_ical_text('\n'.join(desc_lines))
@@ -369,10 +350,10 @@ def events_to_ics(events, tzname='Europe/Paris'):
     footer = ['END:VCALENDAR']
     return '\n'.join(header + body + footer)
 
-# ---------------- Streamlit UI ----------------
+# ---------------- Streamlit UI (no preview) ----------------
 
 st.set_page_config(page_title='Excel → ICS (EDT)', layout='centered')
-st.title('Convertisseur Emplois du Temps (Excel → .ics) — Fusion cellules & descriptions')
+st.title('Convertisseur Emplois du Temps (Excel → .ics) — Corrigé')
 
 uploaded = st.file_uploader('Choisir le fichier Excel (.xlsx)', type=['xlsx'])
 if uploaded is None:
@@ -396,17 +377,6 @@ for sheet in ['EDT P1', 'EDT P2']:
             st.warning(f'Aucun événement détecté dans {sheet} (vérifier la structure).')
             continue
 
-        # preview table
-        preview = pd.DataFrame([{
-            'Résumé': ev['summary'],
-            'Début': ev['start'],
-            'Fin': ev['end'],
-            'Enseignants': ' / '.join(ev['teachers']) if ev['teachers'] else '',
-            'Groupes': ', '.join(ev['groups']) if ev['groups'] else '',
-            'Description': ev['description']
-        } for ev in events])
-        st.write('Aperçu (10 premières lignes) :')
-        st.dataframe(preview.head(10))
-
         ics = events_to_ics(events, tzname='Europe/Paris')
+        st.write(f'{len(events)} événements extraits pour {sheet}')
         st.download_button(label=f'Télécharger {sheet}.ics', data=ics, file_name=f'{sheet}.ics', mime='text/calendar')
