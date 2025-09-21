@@ -1,1 +1,6 @@
 streamlit
+pandas
+dateutil
+datetime
+uuid
+pytz
