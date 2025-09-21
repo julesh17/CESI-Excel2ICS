@@ -1,6 +1,5 @@
 streamlit
 pandas
-dateutil
-datetime
-uuid
+python-dateutil
 pytz
+openpyxl
