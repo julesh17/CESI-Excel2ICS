@@ -5,22 +5,6 @@ import uuid
 from datetime import datetime, date, time
 import pytz
 
-"""
-Corrected Streamlit script focused on handling merged cells ("classe entière").
-
-How it works:
-- Reads each sheet with header=None
-- Locates week rows (lines starting with 'S') and slot rows (lines starting with 'H')
-- For each slot, reads summary/teacher/start/end
-- Detects when a summary sits in the left group column while the right group's summary is empty
-  but the group labels row contains both G1 and G2 -> then treats the slot as "classe entière"
-  and marks group_label = 'G 1 & G 2' (rendered in ICS as "Groupes: G 1 et G 2").
-
-Save as a file and run with:
-    streamlit run excel_to_ics_streamlit_corrected.py
-"""
-
-
 def normalize_group_label(x):
     if x is None:
         return None
@@ -259,7 +243,7 @@ def events_to_ics(events, tzname='Europe/Paris'):
 
 st.set_page_config(page_title='Excel → ICS (EDT)', layout='centered')
 st.title('Convertisseur Emplois du Temps (Excel → .ics)')
-st.markdown('Charge le fichier Excel (format fourni). Le script détecte automatiquement les feuilles "EDT P1" et "EDT P2" si elles existent.')
+st.markdown('Charge le fichier Excel (format Jules). Le script détecte automatiquement les feuilles "EDT P1" et "EDT P2" si elles existent.')
 
 uploaded = st.file_uploader('Choisir le fichier Excel (.xlsx)', type=['xlsx'])
 
