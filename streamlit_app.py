@@ -140,17 +140,28 @@ def parse_sheet_to_events(xls, sheet_name):
                 if not summary_str:
                     continue
 
-                # teacher
-                teacher = None
+                # --- Teachers (multi-enseignants) ---
+                teachers = []
                 if (r + 2) < nrows:
-                    try:
-                        t = df.iat[r + 2, col]
-                        if not pd.isna(t):
-                            teacher = str(t).strip()
-                    except Exception:
-                        teacher = None
+                    for off in range(2, 6):  # on regarde de r+2 à r+5
+                        idx = r + off
+                        if idx >= nrows:
+                            break
+                        try:
+                            t = df.iat[idx, col]
+                        except Exception:
+                            t = None
+                        if t is None or pd.isna(t):
+                            continue
+                        s = str(t).strip()
+                        if not s:
+                            continue
+                        # un enseignant n'est ni une date ni une heure
+                        if not is_time_like(s) and to_date(s) is None:
+                            teachers.append(s)
+                teachers = list(dict.fromkeys(teachers))  # supprime doublons
 
-                # determine the index of the first time-like cell after the summary
+                # --- Détermination du stop_idx (première cellule de temps) ---
                 stop_idx = None
                 for off in range(1, 12):
                     idx = r + off
@@ -165,7 +176,7 @@ def parse_sheet_to_events(xls, sheet_name):
                 if stop_idx is None:
                     stop_idx = min(r + 7, nrows)
 
-                # collect description cells between summary row and first time cell (exclusive)
+                # --- Description (on ignore enseignants/dates/summary) ---
                 desc_parts = []
                 for idx in range(r + 1, stop_idx):
                     if idx >= nrows:
@@ -179,21 +190,18 @@ def parse_sheet_to_events(xls, sheet_name):
                     s = str(cell).strip()
                     if not s:
                         continue
-                    # skip dates and teacher/summary repetitions
                     if to_date(cell) is not None:
                         continue
-                    if teacher and s == teacher:
+                    if s in teachers:  # on ne répète pas les profs
                         continue
                     if s == summary_str:
                         continue
-                    # plausible description
                     desc_parts.append(s)
                 desc_text = " | ".join(dict.fromkeys(desc_parts))
 
-                # times: prefer the first time-like cell (start) and the next distinct time-like cell (end)
+                # --- Heures de début / fin ---
                 start_val = None
                 end_val = None
-                # search from r+1 up to r+12 for times
                 for off in range(1, 13):
                     idx = r + off
                     if idx >= nrows:
@@ -215,16 +223,15 @@ def parse_sheet_to_events(xls, sheet_name):
                 if start_t is None or end_t is None:
                     continue
 
-                # date of the day
+                # --- Date du jour ---
                 date_cell = df.iat[date_row, c]
                 d = to_date(date_cell)
                 if d is None:
                     continue
-
                 dtstart = datetime.combine(d, start_t)
                 dtend = datetime.combine(d, end_t)
 
-                # groups
+                # --- Groupes ---
                 gl = None
                 gl_next = None
                 if group_row < nrows:
@@ -258,14 +265,14 @@ def parse_sheet_to_events(xls, sheet_name):
 
                 raw_events.append({
                     'summary': summary_str,
-                    'teachers': set([teacher]) if teacher else set(),
+                    'teachers': set(teachers),
                     'descriptions': set([desc_text]) if desc_text else set(),
                     'start': dtstart,
                     'end': dtend,
                     'groups': groups
                 })
 
-    # merge events by (summary,start,end)
+    # --- Fusion des événements par (summary, start, end) ---
     merged = {}
     for e in raw_events:
         key = (e['summary'], e['start'], e['end'])
