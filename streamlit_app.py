@@ -1,247 +1,143 @@
 import streamlit as st
 import pandas as pd
-import re
+from dateutil import parser as dtparser
+from datetime import timedelta
 import uuid
-from datetime import datetime, date, time, timedelta
 import pytz
 
-"""
-Streamlit app : Convertit les feuilles d'un fichier Excel "EDT" (format tableau horaire) en fichiers .ics
+# --- Fonctions utilitaires ---
 
-- Conçu pour le fichier fourni (ex. feuilles "EDT P1" et "EDT P2").
-- Lit chaque feuille sans en-têtes (header=None) et recherche :
-  * les lignes de semaine (commençant par 'S 40', 'S 41', ...)
-  * les blocs de créneaux commençant par 'H1', 'H2', ...
-  * pour chaque créneau : titre (ligne Hn), enseignant (Hn+2), heure début (Hn+4), heure fin (Hn+5)
-  * les dates des jours (ligne juste après la ligne "S ...") et les colonnes de groupes (G 1, G2)
-- Produit un .ics (un par feuille sélectionnée) comprenant tous les événements (séances promo entières et séances de groupes).
-
-Usage :
-  streamlit run excel_to_ics_streamlit.py
-
-"""
-
-# ---------- Parsing helpers ----------
-
-def find_week_rows(df):
-    """Return indices of rows where column 0 contains 'S ' (semaine)."""
-    s_rows = []
-    for i in range(len(df)):
-        v = df.iat[i, 0]
-        if isinstance(v, str) and re.match(r'^\s*S\s*\d+', v.strip()):
-            s_rows.append(i)
-    return s_rows
-
-
-def find_slot_rows(df):
-    """Return indices of rows where column 0 contains 'H' (créneau H1, H2...)."""
-    h_rows = []
-    for i in range(len(df)):
-        v = df.iat[i, 0]
-        if isinstance(v, str) and re.match(r'^\s*H\d+', v.strip()):
-            h_rows.append(i)
-    return h_rows
-
-
-def is_date_cell(x):
-    return isinstance(x, (pd.Timestamp, datetime, date))
-
-
-def is_time_cell(x):
-    return isinstance(x, time) or isinstance(x, datetime) or isinstance(x, pd.Timestamp)
-
-
-def parse_sheet_to_events(xls, sheet_name):
-    """Parse a timetable-style sheet (no header) and return a list of events.
-
-    Each event is a dict {summary, teacher, start (datetime), end (datetime), group_label}
-    """
-    df = pd.read_excel(xls, sheet_name=sheet_name, header=None)
-    nrows, ncols = df.shape
-
-    s_rows = find_week_rows(df)
-    h_rows = find_slot_rows(df)
-
-    events = []
-    for r in h_rows:
-        # nearest preceding week header
-        p_candidates = [s for s in s_rows if s <= r]
-        if not p_candidates:
-            continue
-        p = max(p_candidates)
-        date_row = p + 1
-        group_row = p + 2
-
-        # find columns where date_row contains a date (these are the left columns for each weekday)
-        date_cols = [c for c in range(ncols) if date_row < nrows and is_date_cell(df.iat[date_row, c])]
-
-        # for each weekday (left column c), consider that day may have up to 2 group columns: c and c+1
-        for c in date_cols:
-            for col in (c, c + 1):
-                if col >= ncols:
-                    continue
-                summary = df.iat[r, col] if r < nrows else None
-                if pd.isna(summary) or summary is None:
-                    continue
-
-                teacher = df.iat[r + 2, col] if (r + 2) < nrows else None
-                if pd.isna(teacher):
-                    teacher = None
-
-                # start/end times are typically at r+4 and r+5 (observed in the sheet)
-                start_val = df.iat[r + 4, col] if (r + 4) < nrows else None
-                end_val = df.iat[r + 5, col] if (r + 5) < nrows else None
-
-                # fallback: scan the next few rows to find time cells if not in the expected offset
-                if start_val is None or (isinstance(start_val, float) and pd.isna(start_val)):
-                    for off in range(1, 9):
-                        idx = r + off
-                        if idx >= nrows:
-                            break
-                        v = df.iat[idx, col]
-                        if is_time_cell(v):
-                            start_val = v
-                            break
-
-                if end_val is None or (isinstance(end_val, float) and pd.isna(end_val)):
-                    for off in range(1, 11):
-                        idx = r + off
-                        if idx >= nrows:
-                            break
-                        v = df.iat[idx, col]
-                        if is_time_cell(v) and v != start_val:
-                            end_val = v
-                            break
-
-                if start_val is None or end_val is None or pd.isna(start_val) or pd.isna(end_val):
-                    # couldn't find a valid time pair for this cell -> skip
-                    continue
-
-                # normalize date (left column c)
-                date_cell = df.iat[date_row, c]
-                if isinstance(date_cell, pd.Timestamp):
-                    d = date_cell.to_pydatetime().date()
-                elif isinstance(date_cell, datetime):
-                    d = date_cell.date()
-                elif isinstance(date_cell, date):
-                    d = date_cell
-                else:
-                    continue
-
-                # normalize start/end to time
-                if isinstance(start_val, pd.Timestamp) or isinstance(start_val, datetime):
-                    start_t = start_val.to_pydatetime().time() if isinstance(start_val, pd.Timestamp) else start_val.time()
-                elif isinstance(start_val, time):
-                    start_t = start_val
-                else:
-                    # unknown format
-                    continue
-
-                if isinstance(end_val, pd.Timestamp) or isinstance(end_val, datetime):
-                    end_t = end_val.to_pydatetime().time() if isinstance(end_val, pd.Timestamp) else end_val.time()
-                elif isinstance(end_val, time):
-                    end_t = end_val
-                else:
-                    continue
-
-                dtstart = datetime.combine(d, start_t)
-                dtend = datetime.combine(d, end_t)
-                # naive -> localize later when writing ICS
-
-                # attempt to read group label
-                group_label = None
-                if group_row < nrows:
-                    gl = df.iat[group_row, col]
-                    if not pd.isna(gl):
-                        group_label = str(gl)
-
-                events.append({
-                    'summary': str(summary).strip(),
-                    'teacher': str(teacher).strip() if teacher is not None else None,
-                    'start': dtstart,
-                    'end': dtend,
-                    'group_label': group_label
-                })
-    return events
-
-
-# ---------- ICS writer ----------
-
-def escape_ical_text(s: str) -> str:
-    if s is None:
-        return ""
-    s = s.replace('\\', '\\\\')
-    s = s.replace('\n', '\\n')
-    s = s.replace(',', '\\,')
-    s = s.replace(';', '\\;')
-    return s
-
-
-def events_to_ics(events, tzname='Europe/Paris'):
-    tz = pytz.timezone(tzname)
-    header = [
-        'BEGIN:VCALENDAR',
-        'VERSION:2.0',
-        'PRODID:-//EDT Export//FR',
-        'CALSCALE:GREGORIAN',
-    ]
-    body = []
-    for ev in events:
-        uid = str(uuid.uuid4())
-        dtstart = tz.localize(ev['start']).strftime('%Y%m%dT%H%M%S')
-        dtend = tz.localize(ev['end']).strftime('%Y%m%dT%H%M%S')
-        summary = escape_ical_text(ev['summary'])
-        desc_lines = []
-        if ev.get('teacher'):
-            desc_lines.append(f"Enseignant: {ev['teacher']}")
-        if ev.get('group_label'):
-            desc_lines.append(f"Groupe: {ev['group_label']}")
-        description = escape_ical_text('\n'.join(desc_lines))
-
-        body.extend([
-            'BEGIN:VEVENT',
-            f'UID:{uid}',
-            f'DTSTAMP:{datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")}',
-            f'DTSTART;TZID={tzname}:{dtstart}',
-            f'DTEND;TZID={tzname}:{dtend}',
-            f'SUMMARY:{summary}',
-            f'DESCRIPTION:{description}',
-            'END:VEVENT'
-        ])
-
-    footer = ['END:VCALENDAR']
-    return '\n'.join(header + body + footer)
-
-
-# ---------- Streamlit UI ----------
-
-st.set_page_config(page_title='Excel → ICS (EDT)', layout='centered')
-st.title('Convertisseur Emplois du Temps (Excel → .ics)')
-st.markdown('Charge le fichier Excel (format fourni). Le script détecte automatiquement les feuilles "EDT P1" et "EDT P2" si elles existent.')
-
-uploaded = st.file_uploader('Choisir le fichier Excel (.xlsx)', type=['xlsx'])
-
-if uploaded is not None:
+def parse_datetime(date_val, time_val=None):
+    if pd.isna(date_val):
+        return None
+    if time_val is None or pd.isna(time_val):
+        s = str(date_val)
+    else:
+        s = f"{date_val} {time_val}"
     try:
-        xls = pd.ExcelFile(uploaded)
-        sheets = xls.sheet_names
-        st.write('Feuilles trouvées :', sheets)
+        return dtparser.parse(s, dayfirst=True)
+    except Exception:
+        return None
 
-        default = [s for s in ['EDT P1', 'EDT P2'] if s in sheets]
-        to_convert = st.multiselect('Feuilles à convertir en .ics', options=sheets, default=default)
 
-        if st.button('Générer les fichiers .ics'):
-            for sheet in to_convert:
-                with st.spinner(f'Conversion {sheet} ...'):
-                    events = parse_sheet_to_events(uploaded, sheet)
-                    if not events:
-                        st.warning(f'Aucun événement trouvé pour la feuille {sheet} (vérifier la structure).')
-                        continue
-                    ics = events_to_ics(events, tzname='Europe/Paris')
-                    n = len(events)
-                    st.success(f'{n} événements extraits pour {sheet}')
-                    st.download_button(label=f'Télécharger {sheet}.ics', data=ics, file_name=f'{sheet}.ics', mime='text/calendar')
-    except Exception as e:
-        st.error('Erreur lors de la lecture du fichier : ' + str(e))
-else:
-    st.info('Upload un fichier .xlsx pour commencer.')
+def ical_escape(text):
+    if text is None:
+        return ""
+    return str(text).replace("\\", "\\\\").replace(",", "\\,").replace(";", "\\;").replace("\n", "\\n")
+
+
+def make_ics(df, tz):
+    events = []
+    for _, row in df.iterrows():
+        title = row.get("Titre") or row.get("Summary") or "Cours"
+        date = row.get("Date") or row.get("Start")
+        hdeb = row.get("Heure Début") or row.get("Start_time")
+        hfin = row.get("Heure Fin") or row.get("End_time")
+        loc = row.get("Lieu") or row.get("Location") or ""
+        desc = row.get("Description") or ""
+        groupe = row.get("Groupe") if "Groupe" in row else None
+
+        dtstart = parse_datetime(date, hdeb)
+        dtend = parse_datetime(date, hfin)
+
+        if dtstart is None or dtend is None:
+            continue
+
+        dtstart = tz.localize(dtstart)
+        dtend = tz.localize(dtend)
+
+        # Gestion groupes
+        if isinstance(groupe, str) and groupe.strip().upper() == "G 1":
+            desc = desc + "\nGroupe: G 1"
+        elif isinstance(groupe, str) and groupe.strip().upper() == "G 2":
+            desc = desc + "\nGroupe: G 2"
+        elif isinstance(groupe, str) and "classe entière" in groupe.lower():
+            desc = desc + "\nGroupes: G 1 et G 2"
+
+        uid = str(uuid.uuid4())
+
+        event = f"""BEGIN:VEVENT
+UID:{uid}
+DTSTART;TZID=Europe/Paris:{dtstart.strftime('%Y%m%dT%H%M%S')}
+DTEND;TZID=Europe/Paris:{dtend.strftime('%Y%m%dT%H%M%S')}
+SUMMARY:{ical_escape(title)}
+LOCATION:{ical_escape(loc)}
+DESCRIPTION:{ical_escape(desc)}
+END:VEVENT"""
+        events.append(event)
+
+    ics = "BEGIN:VCALENDAR\nVERSION:2.0\nPRODID:-//EDT Export//FR\n" + "\n".join(events) + "\nEND:VCALENDAR"
+    return ics
+
+
+def calcul_heures(df):
+    if not set(["Titre", "Date", "Heure Début", "Heure Fin", "Groupe"]).issubset(df.columns):
+        return pd.DataFrame()
+
+    df2 = df.dropna(subset=["Titre", "Date", "Heure Début", "Heure Fin"])
+    df2["Début"] = pd.to_datetime(df2["Date"].astype(str) + " " + df2["Heure Début"].astype(str), errors="coerce", dayfirst=True)
+    df2["Fin"] = pd.to_datetime(df2["Date"].astype(str) + " " + df2["Heure Fin"].astype(str), errors="coerce", dayfirst=True)
+    df2["Durée_h"] = (df2["Fin"] - df2["Début"]).dt.total_seconds() / 3600
+
+    return df2.groupby(["Groupe", "Titre"]).agg({"Durée_h": "sum"}).reset_index()
+
+
+def recap_par(df, par="Titre"):
+    if not set(["Titre", "Date", "Heure Début", "Heure Fin", "Groupe", "Enseignant"]).issubset(df.columns):
+        return pd.DataFrame()
+
+    df2 = df.dropna(subset=["Titre", "Date", "Heure Début", "Heure Fin"])
+    df2["Début"] = pd.to_datetime(df2["Date"].astype(str) + " " + df2["Heure Début"].astype(str), errors="coerce", dayfirst=True)
+    df2["Fin"] = pd.to_datetime(df2["Date"].astype(str) + " " + df2["Heure Fin"].astype(str), errors="coerce", dayfirst=True)
+    df2["Durée_h"] = (df2["Fin"] - df2["Début"]).dt.total_seconds() / 3600
+
+    return df2.groupby([par]).agg({"Durée_h": "sum"}).reset_index()
+
+# --- Interface Streamlit avec multipages ---
+st.sidebar.title("Menu")
+page = st.sidebar.radio("Aller à", ["Exporter ICS", "Heures par groupe", "Récapitulatif"])
+
+uploaded_file = st.file_uploader("Choisissez le fichier Excel", type=["xlsx"])
+
+if uploaded_file is not None:
+    xls = pd.ExcelFile(uploaded_file)
+    
+    if page == "Exporter ICS":
+        st.title("Export Emploi du Temps vers iCalendar (.ics)")
+        st.write("Feuilles trouvées :", xls.sheet_names)
+        for sheet in ["EDT P1", "EDT P2"]:
+            if sheet in xls.sheet_names:
+                df = pd.read_excel(xls, sheet_name=sheet)
+                tz = pytz.timezone("Europe/Paris")
+                ics_content = make_ics(df, tz)
+                st.download_button(
+                    label=f"Télécharger {sheet}.ics",
+                    data=ics_content,
+                    file_name=f"{sheet}.ics",
+                    mime="text/calendar"
+                )
+
+    elif page == "Heures par groupe":
+        st.title("Calcul des heures par matière et par groupe")
+        for sheet in ["EDT P1", "EDT P2"]:
+            if sheet in xls.sheet_names:
+                st.subheader(sheet)
+                df = pd.read_excel(xls, sheet_name=sheet)
+                heures = calcul_heures(df)
+                if not heures.empty:
+                    st.dataframe(heures)
+                else:
+                    st.warning("Structure de feuille non conforme pour ce calcul.")
+
+    elif page == "Récapitulatif":
+        st.title("Récapitulatif par enseignant ou matière")
+        choix = st.radio("Regrouper par", ["Titre", "Enseignant"])
+        for sheet in ["EDT P1", "EDT P2"]:
+            if sheet in xls.sheet_names:
+                st.subheader(sheet)
+                df = pd.read_excel(xls, sheet_name=sheet)
+                recap = recap_par(df, par=choix)
+                if not recap.empty:
+                    st.dataframe(recap)
+                else:
+                    st.warning("Structure de feuille non conforme pour ce calcul.")
