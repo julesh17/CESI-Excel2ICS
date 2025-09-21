@@ -353,7 +353,7 @@ def events_to_ics(events, tzname='Europe/Paris'):
 # ---------------- Streamlit UI (no preview) ----------------
 
 st.set_page_config(page_title='Excel → ICS (EDT)', layout='centered')
-st.title('Convertisseur Emplois du Temps (Excel → .ics) — Corrigé')
+st.title('Convertisseur Emplois du Temps (Excel → .ics)')
 
 uploaded = st.file_uploader('Choisir le fichier Excel (.xlsx)', type=['xlsx'])
 if uploaded is None:
