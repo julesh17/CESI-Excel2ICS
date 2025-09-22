@@ -5,6 +5,7 @@ import uuid
 from datetime import datetime, date, time
 from dateutil import parser as dtparser
 import pytz
+from openpyxl import load_workbook
 
 # ---------------- Utilities ----------------
 
@@ -36,7 +37,6 @@ def is_time_like(x):
     s = str(x).strip()
     if not s:
         return False
-    # match 08:30, 8:30, 08h30, 8h30, 08:30 AM, etc.
     if re.match(r'^\d{1,2}[:hH]\d{2}(\s*[AaPp][Mm]\.?)*$', s):
         return True
     return False
@@ -80,35 +80,35 @@ def to_date(x):
     except Exception:
         return None
 
+# ---------------- Helpers Fusion ----------------
+
+def get_merged_map(xls_path, sheet_name):
+    """Retourne un dict {(row,col): (row1,col1,row2,col2)} si la cellule est fusionnée"""
+    wb = load_workbook(xls_path, data_only=True)
+    ws = wb[sheet_name]
+    merged_map = {}
+    for merged in ws.merged_cells.ranges:
+        r1, r2 = merged.min_row, merged.max_row
+        c1, c2 = merged.min_col, merged.max_col
+        for r in range(r1, r2 + 1):
+            for c in range(c1, c2 + 1):
+                merged_map[(r - 1, c - 1)] = (r1 - 1, c1 - 1, r2 - 1, c2 - 1)
+    return merged_map
+
 # ---------------- Parsing ----------------
 
 def find_week_rows(df):
-    rows = []
-    for i in range(len(df)):
-        try:
-            v = df.iat[i, 0]
-        except Exception:
-            v = None
-        if isinstance(v, str) and re.match(r'^\s*S\s*\d+', v.strip(), re.I):
-            rows.append(i)
-    return rows
+    return [i for i in range(len(df)) if isinstance(df.iat[i, 0], str) and re.match(r'^\s*S\s*\d+', df.iat[i, 0].strip(), re.I)]
 
 
 def find_slot_rows(df):
-    rows = []
-    for i in range(len(df)):
-        try:
-            v = df.iat[i, 0]
-        except Exception:
-            v = None
-        if isinstance(v, str) and re.match(r'^\s*H\s*\d+', v.strip(), re.I):
-            rows.append(i)
-    return rows
+    return [i for i in range(len(df)) if isinstance(df.iat[i, 0], str) and re.match(r'^\s*H\s*\d+', df.iat[i, 0].strip(), re.I)]
 
 
-def parse_sheet_to_events(xls, sheet_name):
-    df = pd.read_excel(xls, sheet_name=sheet_name, header=None)
+def parse_sheet_to_events(xls_path, sheet_name):
+    df = pd.read_excel(xls_path, sheet_name=sheet_name, header=None)
     nrows, ncols = df.shape
+    merged_map = get_merged_map(xls_path, sheet_name)
 
     s_rows = find_week_rows(df)
     h_rows = find_slot_rows(df)
@@ -129,10 +129,7 @@ def parse_sheet_to_events(xls, sheet_name):
             for col in (c, c + 1):
                 if col >= ncols:
                     continue
-                try:
-                    summary = df.iat[r, col]
-                except Exception:
-                    summary = None
+                summary = df.iat[r, col] if col < ncols else None
                 if pd.isna(summary) or summary is None:
                     continue
                 summary_str = str(summary).strip()
@@ -146,10 +143,7 @@ def parse_sheet_to_events(xls, sheet_name):
                         idx = r + off
                         if idx >= nrows:
                             break
-                        try:
-                            t = df.iat[idx, col]
-                        except Exception:
-                            t = None
+                        t = df.iat[idx, col]
                         if t is None or pd.isna(t):
                             continue
                         s = str(t).strip()
@@ -159,18 +153,15 @@ def parse_sheet_to_events(xls, sheet_name):
                             teachers.append(s)
                 teachers = list(dict.fromkeys(teachers))
 
-                # --- stop_idx ---
+                # --- Stop index ---
                 stop_idx = None
                 for off in range(1, 12):
                     idx = r + off
                     if idx >= nrows:
                         break
-                    try:
-                        if is_time_like(df.iat[idx, col]):
-                            stop_idx = idx
-                            break
-                    except Exception:
-                        continue
+                    if is_time_like(df.iat[idx, col]):
+                        stop_idx = idx
+                        break
                 if stop_idx is None:
                     stop_idx = min(r + 7, nrows)
 
@@ -179,10 +170,7 @@ def parse_sheet_to_events(xls, sheet_name):
                 for idx in range(r + 1, stop_idx):
                     if idx >= nrows:
                         break
-                    try:
-                        cell = df.iat[idx, col]
-                    except Exception:
-                        cell = None
+                    cell = df.iat[idx, col]
                     if pd.isna(cell) or cell is None:
                         continue
                     s = str(cell).strip()
@@ -190,24 +178,18 @@ def parse_sheet_to_events(xls, sheet_name):
                         continue
                     if to_date(cell) is not None:
                         continue
-                    if s in teachers:
-                        continue
-                    if s == summary_str:
+                    if s in teachers or s == summary_str:
                         continue
                     desc_parts.append(s)
                 desc_text = " | ".join(dict.fromkeys(desc_parts))
 
                 # --- Heures ---
-                start_val = None
-                end_val = None
+                start_val, end_val = None, None
                 for off in range(1, 13):
                     idx = r + off
                     if idx >= nrows:
                         break
-                    try:
-                        v = df.iat[idx, col]
-                    except Exception:
-                        v = None
+                    v = df.iat[idx, col]
                     if is_time_like(v):
                         if start_val is None:
                             start_val = v
@@ -216,48 +198,36 @@ def parse_sheet_to_events(xls, sheet_name):
                             break
                 if start_val is None or end_val is None:
                     continue
-                start_t = to_time(start_val)
-                end_t = to_time(end_val)
+                start_t, end_t = to_time(start_val), to_time(end_val)
                 if start_t is None or end_t is None:
                     continue
 
                 # --- Date ---
-                date_cell = df.iat[date_row, c]
-                d = to_date(date_cell)
+                d = to_date(df.iat[date_row, c])
                 if d is None:
                     continue
-                dtstart = datetime.combine(d, start_t)
-                dtend = datetime.combine(d, end_t)
+                dtstart, dtend = datetime.combine(d, start_t), datetime.combine(d, end_t)
 
                 # --- Groupes ---
-                gl = None
-                gl_next = None
-                if group_row < nrows:
-                    try:
-                        gl_raw = df.iat[group_row, col]
-                        gl = normalize_group_label(gl_raw)
-                    except Exception:
-                        gl = None
-                    if (col + 1) < ncols:
-                        try:
-                            gl_next_raw = df.iat[group_row, col + 1]
-                            gl_next = normalize_group_label(gl_next_raw)
-                        except Exception:
-                            gl_next = None
-
+                gl = normalize_group_label(df.iat[group_row, col] if group_row < nrows else None)
+                gl_next = normalize_group_label(df.iat[group_row, col + 1] if (col + 1) < ncols else None)
                 is_left_col = (col == c)
-                right_summary = None
-                if (col + 1) < ncols:
-                    try:
-                        right_summary = df.iat[r, col + 1]
-                    except Exception:
-                        right_summary = None
+                right_summary = df.iat[r, col + 1] if (col + 1) < ncols else None
 
-                # ✅ Correction attribution des groupes
                 groups = set()
-                if is_left_col and right_summary not in (None, "", float("nan")) and gl and gl_next and gl != gl_next:
-                    groups.add(gl)
-                    groups.add(gl_next)
+                if is_left_col:
+                    # Vérif fusion réelle dans Excel
+                    merged = merged_map.get((r, col))
+                    if merged and (r, col + 1) in merged_map:
+                        # fusion détectée → G1+G2
+                        if gl:
+                            groups.add(gl)
+                        if gl_next:
+                            groups.add(gl_next)
+                    else:
+                        # sinon groupe normal
+                        if gl:
+                            groups.add(gl)
                 else:
                     if gl:
                         groups.add(gl)
@@ -271,7 +241,7 @@ def parse_sheet_to_events(xls, sheet_name):
                     'groups': groups
                 })
 
-    # --- Fusion ---
+    # --- Fusion des événements ---
     merged = {}
     for e in raw_events:
         key = (e['summary'], e['start'], e['end'])
@@ -288,17 +258,14 @@ def parse_sheet_to_events(xls, sheet_name):
         merged[key]['descriptions'].update(e.get('descriptions', set()))
         merged[key]['groups'].update(e.get('groups', set()))
 
-    out = []
-    for v in merged.values():
-        out.append({
-            'summary': v['summary'],
-            'teachers': sorted(list(v['teachers'])),
-            'description': " | ".join(sorted(list(v['descriptions']))) if v['descriptions'] else "",
-            'start': v['start'],
-            'end': v['end'],
-            'groups': sorted(list(v['groups']))
-        })
-    return out
+    return [{
+        'summary': v['summary'],
+        'teachers': sorted(list(v['teachers'])),
+        'description': " | ".join(sorted(list(v['descriptions']))) if v['descriptions'] else "",
+        'start': v['start'],
+        'end': v['end'],
+        'groups': sorted(list(v['groups']))
+    } for v in merged.values()]
 
 # ---------------- ICS writer ----------------
 
@@ -306,10 +273,7 @@ def escape_ical_text(s: str) -> str:
     if s is None:
         return ""
     s = str(s)
-    s = s.replace('\\', '\\\\')
-    s = s.replace('\n', '\\n')
-    s = s.replace(',', '\\,')
-    s = s.replace(';', '\\;')
+    s = s.replace('\\', '\\\\').replace('\n', '\\n').replace(',', '\\,').replace(';', '\\;')
     return s
 
 
@@ -378,7 +342,7 @@ st.write('Feuilles trouvées :', sheets)
 for sheet in ['EDT P1', 'EDT P2']:
     if sheet in sheets:
         st.header(sheet)
-        events = parse_sheet_to_events(xls, sheet)
+        events = parse_sheet_to_events(uploaded, sheet)
         if not events:
             st.warning(f'Aucun événement détecté dans {sheet} (vérifier la structure).')
             continue
