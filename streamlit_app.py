@@ -39,7 +39,6 @@ def is_time_like(x):
     # match 08:30, 8:30, 08h30, 8h30, 08:30 AM, etc.
     if re.match(r'^\d{1,2}[:hH]\d{2}(\s*[AaPp][Mm]\.?)*$', s):
         return True
-    # sometimes there are floats representing time - handled by pandas as Timestamp usually
     return False
 
 
@@ -140,10 +139,10 @@ def parse_sheet_to_events(xls, sheet_name):
                 if not summary_str:
                     continue
 
-                # --- Teachers (multi-enseignants) ---
+                # --- Teachers ---
                 teachers = []
                 if (r + 2) < nrows:
-                    for off in range(2, 6):  # on regarde de r+2 à r+5
+                    for off in range(2, 6):
                         idx = r + off
                         if idx >= nrows:
                             break
@@ -156,12 +155,11 @@ def parse_sheet_to_events(xls, sheet_name):
                         s = str(t).strip()
                         if not s:
                             continue
-                        # un enseignant n'est ni une date ni une heure
                         if not is_time_like(s) and to_date(s) is None:
                             teachers.append(s)
-                teachers = list(dict.fromkeys(teachers))  # supprime doublons
+                teachers = list(dict.fromkeys(teachers))
 
-                # --- Détermination du stop_idx (première cellule de temps) ---
+                # --- stop_idx ---
                 stop_idx = None
                 for off in range(1, 12):
                     idx = r + off
@@ -176,7 +174,7 @@ def parse_sheet_to_events(xls, sheet_name):
                 if stop_idx is None:
                     stop_idx = min(r + 7, nrows)
 
-                # --- Description (on ignore enseignants/dates/summary) ---
+                # --- Description ---
                 desc_parts = []
                 for idx in range(r + 1, stop_idx):
                     if idx >= nrows:
@@ -192,14 +190,14 @@ def parse_sheet_to_events(xls, sheet_name):
                         continue
                     if to_date(cell) is not None:
                         continue
-                    if s in teachers:  # on ne répète pas les profs
+                    if s in teachers:
                         continue
                     if s == summary_str:
                         continue
                     desc_parts.append(s)
                 desc_text = " | ".join(dict.fromkeys(desc_parts))
 
-                # --- Heures de début / fin ---
+                # --- Heures ---
                 start_val = None
                 end_val = None
                 for off in range(1, 13):
@@ -223,7 +221,7 @@ def parse_sheet_to_events(xls, sheet_name):
                 if start_t is None or end_t is None:
                     continue
 
-                # --- Date du jour ---
+                # --- Date ---
                 date_cell = df.iat[date_row, c]
                 d = to_date(date_cell)
                 if d is None:
@@ -255,8 +253,9 @@ def parse_sheet_to_events(xls, sheet_name):
                     except Exception:
                         right_summary = None
 
+                # ✅ Correction attribution des groupes
                 groups = set()
-                if is_left_col and (pd.isna(right_summary) or right_summary is None) and gl and gl_next and gl != gl_next:
+                if is_left_col and right_summary not in (None, "", float("nan")) and gl and gl_next and gl != gl_next:
                     groups.add(gl)
                     groups.add(gl_next)
                 else:
@@ -272,7 +271,7 @@ def parse_sheet_to_events(xls, sheet_name):
                     'groups': groups
                 })
 
-    # --- Fusion des événements par (summary, start, end) ---
+    # --- Fusion ---
     merged = {}
     for e in raw_events:
         key = (e['summary'], e['start'], e['end'])
@@ -357,7 +356,7 @@ def events_to_ics(events, tzname='Europe/Paris'):
     footer = ['END:VCALENDAR']
     return '\n'.join(header + body + footer)
 
-# ---------------- Streamlit UI (no preview) ----------------
+# ---------------- Streamlit UI ----------------
 
 st.set_page_config(page_title='Excel → ICS (EDT)', layout='centered')
 st.title('Convertisseur Emplois du Temps (Excel → .ics)')
