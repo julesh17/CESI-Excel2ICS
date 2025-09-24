@@ -1,19 +1,15 @@
-# 🎈 Blank app template
+# Convertisseur d’emplois du temps (Excel → ICS)
 
-A simple Streamlit app template for you to modify!
+Cette application **Streamlit** permet de convertir un emploi du temps stocké dans un fichier Excel (`.xlsx`) au "bon format" en un fichier calendrier au format **ICS** compatible avec la plupart des logiciels (Google Calendar, Outlook, Apple Calendar, etc.).
 
-[![Open in Streamlit](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://blank-app-template.streamlit.app/)
+Elle est conçue pour traiter des feuilles de type `EDT P1` ou `EDT P2` contenant des créneaux d’emplois du temps avec horaires, cours, enseignants et groupes.
 
-### How to run it on your own machine
+---
 
-1. Install the requirements
+## 🚀 Fonctionnalités
 
-   ```
-   $ pip install -r requirements.txt
-   ```
-
-2. Run the app
-
-   ```
-   $ streamlit run streamlit_app.py
-   ```
+- Import d’un fichier **Excel** (`.xlsx`) contenant des emplois du temps.  
+- Détection automatique des feuilles `EDT P1` et `EDT P2`.  
+- Extraction des événements : matière, enseignants, groupes, description, créneaux horaires.  
+- Conversion en événements **ICS** avec description enrichie.  
+- Téléchargement direct des fichiers `.ics`.  
