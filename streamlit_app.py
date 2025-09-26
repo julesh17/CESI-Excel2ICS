@@ -6,6 +6,7 @@ from datetime import datetime, date, time
 from dateutil import parser as dtparser
 import pytz
 from openpyxl import load_workbook
+import io
 
 # ---------------- Utilities ----------------
 
@@ -37,6 +38,7 @@ def is_time_like(x):
     s = str(x).strip()
     if not s:
         return False
+    # accepte formats hh:mm, hhm m, 9h30, 9:30, 9AM, 9 PM ...
     if re.match(r'^\d{1,2}[:hH]\d{2}(\s*[AaPp][Mm]\.?)*$', s):
         return True
     return False
@@ -82,9 +84,12 @@ def to_date(x):
 
 # ---------------- Helpers Fusion ----------------
 
-def get_merged_map(xls_path, sheet_name):
-    """Retourne un dict {(row,col): (row1,col1,row2,col2)} si la cellule est fusionnée"""
-    wb = load_workbook(xls_path, data_only=True)
+def get_merged_map(xls_fileobj, sheet_name):
+    """
+    xls_fileobj: file-like (BytesIO or path)
+    Retourne un dict {(row0,col0): (r1,c1,r2,c2)} où les indices sont 0-based
+    """
+    wb = load_workbook(xls_fileobj, data_only=True)
     ws = wb[sheet_name]
     merged_map = {}
     for merged in ws.merged_cells.ranges:
@@ -105,10 +110,25 @@ def find_slot_rows(df):
     return [i for i in range(len(df)) if isinstance(df.iat[i, 0], str) and re.match(r'^\s*H\s*\d+', df.iat[i, 0].strip(), re.I)]
 
 
-def parse_sheet_to_events(xls_path, sheet_name):
-    df = pd.read_excel(xls_path, sheet_name=sheet_name, header=None)
+def parse_sheet_to_events(xls_fileobj, sheet_name):
+    """
+    xls_fileobj: file-like (BytesIO). sheet_name: string.
+    Retour: liste d'événements dict {summary, teachers, description, start, end, groups}
+    """
+    # pandas accepte un BytesIO
+    df = pd.read_excel(xls_fileobj, sheet_name=sheet_name, header=None)
     nrows, ncols = df.shape
-    merged_map = get_merged_map(xls_path, sheet_name)
+
+    # pour load_workbook on doit récréer un BytesIO car pandas a consommé le flux
+    # si xls_fileobj est BytesIO, getbuffer() / seek(0) possible
+    # Ici on reopen via a new BytesIO from the original content if available
+    if hasattr(xls_fileobj, "getvalue"):
+        book_io_for_openpyxl = io.BytesIO(xls_fileobj.getvalue())
+    else:
+        # fallback (si xls_fileobj est un path)
+        book_io_for_openpyxl = xls_fileobj
+
+    merged_map = get_merged_map(book_io_for_openpyxl, sheet_name)
 
     s_rows = find_week_rows(df)
     h_rows = find_slot_rows(df)
@@ -218,14 +238,13 @@ def parse_sheet_to_events(xls_path, sheet_name):
                 if is_left_col:
                     # Vérif fusion réelle dans Excel
                     merged = merged_map.get((r, col))
+                    # si fusion détectée couvrant la cellule et la suivante, ajouter les 2 groupes
                     if merged and (r, col + 1) in merged_map:
-                        # fusion détectée → G1+G2
                         if gl:
                             groups.add(gl)
                         if gl_next:
                             groups.add(gl_next)
                     else:
-                        # sinon groupe normal
                         if gl:
                             groups.add(gl)
                 else:
@@ -241,7 +260,7 @@ def parse_sheet_to_events(xls_path, sheet_name):
                     'groups': groups
                 })
 
-    # --- Fusion des événements ---
+    # --- Fusion des événements --- 
     merged = {}
     for e in raw_events:
         key = (e['summary'], e['start'], e['end'])
@@ -258,14 +277,14 @@ def parse_sheet_to_events(xls_path, sheet_name):
         merged[key]['descriptions'].update(e.get('descriptions', set()))
         merged[key]['groups'].update(e.get('groups', set()))
 
-    return [{
+    return [ {
         'summary': v['summary'],
         'teachers': sorted(list(v['teachers'])),
         'description': " | ".join(sorted(list(v['descriptions']))) if v['descriptions'] else "",
         'start': v['start'],
         'end': v['end'],
         'groups': sorted(list(v['groups']))
-    } for v in merged.values()]
+    } for v in merged.values() ]
 
 # ---------------- ICS writer ----------------
 
@@ -276,8 +295,34 @@ def escape_ical_text(s: str) -> str:
     s = s.replace('\\', '\\\\').replace('\n', '\\n').replace(',', '\\,').replace(';', '\\;')
     return s
 
+def build_paris_vtimezone_text():
+    """Retourne un bloc VTIMEZONE texte pour Europe/Paris (utile pour clients qui attendent VTIMEZONE)."""
+    return "\n".join([
+        "BEGIN:VTIMEZONE",
+        "TZID:Europe/Paris",
+        "X-LIC-LOCATION:Europe/Paris",
+        "BEGIN:DAYLIGHT",
+        "TZOFFSETFROM:+0100",
+        "TZOFFSETTO:+0200",
+        "TZNAME:CEST",
+        "DTSTART:19700329T020000",
+        "RRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=-1SU",
+        "END:DAYLIGHT",
+        "BEGIN:STANDARD",
+        "TZOFFSETFROM:+0200",
+        "TZOFFSETTO:+0100",
+        "TZNAME:CET",
+        "DTSTART:19701025T030000",
+        "RRULE:FREQ=YEARLY;BYMONTH=10;BYDAY=-1SU",
+        "END:STANDARD",
+        "END:VTIMEZONE"
+    ])
 
 def events_to_ics(events, tzname='Europe/Paris'):
+    """
+    events: list of dicts with keys 'summary','teachers','description','start','end','groups'
+    Retourne un string ICS complet incluant VTIMEZONE.
+    """
     tz = pytz.timezone(tzname)
     header = [
         'BEGIN:VCALENDAR',
@@ -285,11 +330,28 @@ def events_to_ics(events, tzname='Europe/Paris'):
         'PRODID:-//EDT Export//FR',
         'CALSCALE:GREGORIAN',
     ]
-    body = []
+
+    # ajouter VTIMEZONE textuel (Outlook a besoin des règles pour correctement afficher DST)
+    vtz = build_paris_vtimezone_text()
+    body = [vtz]
+
     for ev in events:
         uid = str(uuid.uuid4())
-        dtstart = tz.localize(ev['start']).strftime('%Y%m%dT%H%M%S')
-        dtend = tz.localize(ev['end']).strftime('%Y%m%dT%H%M%S')
+        # localize pour avoir l'heure locale (naive -> tz aware)
+        # if event times are already tz-aware, do not localize
+        start_dt = ev['start']
+        end_dt = ev['end']
+        if start_dt.tzinfo is None:
+            start_loc = tz.localize(start_dt)
+        else:
+            start_loc = start_dt.astimezone(tz)
+        if end_dt.tzinfo is None:
+            end_loc = tz.localize(end_dt)
+        else:
+            end_loc = end_dt.astimezone(tz)
+
+        dtstart = start_loc.strftime('%Y%m%dT%H%M%S')
+        dtend = end_loc.strftime('%Y%m%dT%H%M%S')
         summary = escape_ical_text(ev['summary'])
 
         desc_lines = []
@@ -330,8 +392,12 @@ if uploaded is None:
     st.info('Upload un fichier .xlsx pour commencer.')
     st.stop()
 
+# Lire les bytes une seule fois et créer un BytesIO réutilisable
+file_bytes = uploaded.read()
+file_io = io.BytesIO(file_bytes)
+
 try:
-    xls = pd.ExcelFile(uploaded)
+    xls = pd.ExcelFile(io.BytesIO(file_bytes))
     sheets = xls.sheet_names
 except Exception as e:
     st.error('Impossible de lire le fichier Excel: ' + str(e))
@@ -342,7 +408,8 @@ st.write('Feuilles trouvées :', sheets)
 for sheet in ['EDT P1', 'EDT P2']:
     if sheet in sheets:
         st.header(sheet)
-        events = parse_sheet_to_events(uploaded, sheet)
+        # on passe un BytesIO "frais" à la fonction (parse_sheet_to_events lira via pandas et openpyxl)
+        events = parse_sheet_to_events(io.BytesIO(file_bytes), sheet)
         if not events:
             st.warning(f'Aucun événement détecté dans {sheet} (vérifier la structure).')
             continue
